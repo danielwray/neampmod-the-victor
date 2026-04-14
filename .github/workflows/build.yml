@@ -1,0 +1,165 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v[0-9]*.[0-9]*.[0-9]*']
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+        with:
+          path: neampmod-the-victor
+
+      - name: Checkout engine mirror
+        uses: actions/checkout@v4
+        with:
+          repository: danielwray/neampmod-engine-mirror
+          token: ${{ secrets.ENGINE_TOKEN }}
+          path: neampmod-engine
+
+      - name: Install Rust 1.92
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.92'
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: neampmod-the-victor -> target
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            build-essential \
+            libasound2-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libgl1-mesa-dev \
+            libx11-xcb-dev \
+            libx11-dev \
+            libgtk-3-dev
+
+      - name: Inject version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: neampmod-the-victor
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          echo "Building version $VERSION"
+
+      - name: Build
+        working-directory: neampmod-the-victor
+        run: cargo run --release -p xtask -- bundle the-victor --release
+
+      - name: Package Linux artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: neampmod-the-victor
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          mkdir -p release-artifacts
+          cp target/bundled/the-victor.vst3/Contents/x86_64-linux/the-victor.so \
+             "release-artifacts/neampmod-the-victor-linux-v${VERSION}.vst3"
+          cp target/bundled/the-victor.clap \
+             "release-artifacts/neampmod-the-victor-linux-v${VERSION}.clap"
+
+      - name: Upload Linux artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-artifacts
+          path: neampmod-the-victor/release-artifacts/
+          retention-days: 7
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+        with:
+          path: neampmod-the-victor
+
+      - name: Checkout engine mirror
+        uses: actions/checkout@v4
+        with:
+          repository: danielwray/neampmod-engine-mirror
+          token: ${{ secrets.ENGINE_TOKEN }}
+          path: neampmod-engine
+
+      - name: Install Rust 1.92
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.92'
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: neampmod-the-victor -> target
+
+      - name: Inject version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        working-directory: neampmod-the-victor
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          echo "Building version $VERSION"
+
+      - name: Build
+        shell: bash
+        working-directory: neampmod-the-victor
+        run: cargo run --release -p xtask -- bundle the-victor --release
+
+      - name: Package Windows artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        working-directory: neampmod-the-victor
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          mkdir -p release-artifacts
+          cp "target/bundled/the-victor.vst3/Contents/x86_64-win/the-victor.vst3" \
+             "release-artifacts/neampmod-the-victor-win-v${VERSION}.vst3"
+          cp "target/bundled/the-victor.clap" \
+             "release-artifacts/neampmod-the-victor-win-v${VERSION}.clap"
+
+      - name: Upload Windows artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifacts
+          path: neampmod-the-victor/release-artifacts/
+          retention-days: 7
+
+  release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-artifacts
+          path: release-artifacts/
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-artifacts
+          path: release-artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "The Victor ${{ github.ref_name }}"
+          files: release-artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
