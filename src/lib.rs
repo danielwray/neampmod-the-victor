@@ -166,8 +166,10 @@ impl Default for TheVictorParams {
 // =============================================================================
 
 // --- Power Supply ---
-/// 5C1 preamp B+ voltage (B+2 tap, after 25kΩ dropping resistor)
-/// With 25kΩ drop from ~330V B+1, screen/preamp node measures ~220V under idle current.
+/// Nominal B+1 voltage at rectifier output / first filter cap (5Y3 loaded).
+/// Layout diagram measurement: 340V ±20% at 5Y3GT output.
+const NOMINAL_BPLUS_5C1: f32 = 340.0;
+/// Layout measurement: 6SJ7 plate at ~130V → supply ≈ 130 + (I_plate × 250kΩ) ≈ 220V.
 const PREAMP_BPLUS_5C1: f32 = 220.0;
 
 // --- Tubes ---
@@ -202,36 +204,51 @@ fn build_preamp_tube(sample_rate: f32, spec_name: &str) -> TubeStage {
 
 /// Build the 5C1 power supply filter chain.
 ///
-/// 5C1 filter topology (from schematic):
-///   5Y3 → [8µF/450V] → 25kΩ → [8µF/450V]
+/// 5C1 filter topology (from layout diagram):
+///   5Y3 → [8µF] → 500Ω → [8µF] → 25kΩ → preamp
 ///
-/// B+1 (fc_8u_1): ~330V — power tube plate via OT center tap
-/// B+2 (fc_8u_2): ~220V — screen grid + preamp supply
+/// B+1 (fc_8u_1): ~340V — OT center tap (6V6 plate supply)
+/// B+2 (fc_8u_2): ~336V — 6V6 screen supply (500Ω decouples from OT, τ = 4ms)
+/// B+3 (preamp):  ~220V — 6SJ7 plate supply (25kΩ drop, τ = 200ms from B+2)
+///
+/// The 500Ω creates a sag cascade: plate droops first, screen follows ~4ms
+/// later, preamp responds last. This gives the amp its characteristic "bloom"
+/// after hard pick attacks — screen voltage holds while plate sags.
 fn build_5c1_filter_chain() -> FilterChainSpec {
     FilterChainSpec {
         nodes: vec![
-            // First filter cap after rectifier: B+1 — power tube
+            // B+1: first filter cap after rectifier — OT center tap (6V6 plate)
             FilterChainNodeSpec::Capacitor(FilterCapSpec {
                 instance_id: "fc_8u_1".to_string(),
                 capacitance_uf: 8.0,
                 voltage_rating: 450.0,
             }),
-            // 25kΩ dropping resistor (screen grid + preamp supply)
+            // ~500Ω decoupling resistor
             FilterChainNodeSpec::Resistor(FilterResistorSpec {
-                resistance_ohms: 25_000.0,
+                resistance_ohms: 518.0,
             }),
-            // Second filter cap: B+2 — preamp supply
+            // B+2: second filter cap
             FilterChainNodeSpec::Capacitor(FilterCapSpec {
                 instance_id: "fc_8u_2".to_string(),
+                capacitance_uf: 8.0,
+                voltage_rating: 450.0,
+            }),
+            // ~25kΩ dropping resistor
+            FilterChainNodeSpec::Resistor(FilterResistorSpec {
+                resistance_ohms: 25_103.0,
+            }),
+            // B+3: preamp supply node
+            FilterChainNodeSpec::Capacitor(FilterCapSpec {
+                instance_id: "fc_8u_3".to_string(),
                 capacitance_uf: 8.0,
                 voltage_rating: 450.0,
             }),
         ],
         b_plus_assignments: HashMap::from([
             ("power_tube".to_string(), "fc_8u_1".to_string()),
-            ("preamp".to_string(), "fc_8u_2".to_string()),
+            ("preamp".to_string(), "fc_8u_3".to_string()),
         ]),
-        nominal_b_plus_volts: 330.0,
+        nominal_b_plus_volts: 340.0,
     }
 }
 
@@ -239,23 +256,23 @@ fn build_5c1_filter_chain() -> FilterChainSpec {
 ///
 /// Based on the fender_5f1() preset (closest match: SE 6V6, cathodyne PI,
 /// no NFB, 5Y3 rectifier) with 5C1-specific modifications:
-/// - Cathode bias: 470Ω (same as 5F1)
-/// - Grid leak: 1MΩ (volume pot, not 5F1's fixed 220kΩ resistor)
-/// - 2-tap filter chain for B+ distribution (25kΩ dropping resistor)
+/// - Cathode bias: 500Ω
+/// - Grid leak: 1MΩ (volume pot)
+/// - 3-tap filter chain for B+ distribution
 /// - Jensen P8R speaker impedance (physics-based, 8" alnico, open-back)
 /// - Tube specs from registry
 fn build_5c1_amp_topology_config() -> AmpTopologyConfig {
     let mut config = AmpTopologyConfig::fender_5f1();
 
     // Enable current-based sag tracking for authentic 5Y3 rectifier response
-    config.power_supply.sag = config.power_supply.sag.with_current_tracking(80.0);
+    config.power_supply.sag = config.power_supply.sag.with_current_tracking(55.0);
 
     // Set specific tube specs from registry
     config.power_section.power_tube_spec = Some(POWER_TUBE_SPEC.into());
     config.power_supply.sag.rectifier_spec = Some(RECTIFIER_SPEC.into());
 
-    // 5C1 cathode bias: 470Ω Rk, 25µF Ck, ~5kΩ plate load (OT primary)
-    config.power_section.cathode_bias = Some((470.0, 25e-6, 5_000.0));
+    // 5C1 cathode bias: 500Ω Rk, 2.5µF Ck, ~5kΩ plate load (OT primary)
+    config.power_section.cathode_bias = Some((500.0, 2.5e-6, 5_000.0));
 
     // 5C1 has no fixed grid-to-ground resistor on the 6V6 — the volume pot
     // bottom rail (wiper to ground) serves as the grid return path.
@@ -332,6 +349,12 @@ pub struct TheVictor {
     // Shared with GUI (written once per buffer from audio thread)
     meter_peak_volts: Arc<atomic_float::AtomicF32>,
 
+    // Circuit stats (shared with GUI, written once per buffer)
+    meter_bplus_volts: Arc<atomic_float::AtomicF32>,   // B+ main rail (nominal 330V, sag-adjusted)
+    meter_v1_volts: Arc<atomic_float::AtomicF32>,     // V1 (6SJ7) plate supply
+    meter_v2_volts: Arc<atomic_float::AtomicF32>,     // V2 (6V6GT) plate supply
+    meter_output_db: Arc<atomic_float::AtomicF32>,    // Peak output level in dB
+
     // IR loading state (shared with GUI)
     ir_load_status: Arc<atomic::AtomicU8>,  // 0=pending, 1=success, 2=failed
 }
@@ -403,6 +426,11 @@ impl Default for TheVictor {
             cached_input_trim_db: 0.0,
 
             meter_peak_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
+
+            meter_bplus_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
+            meter_v1_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
+            meter_v2_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
+            meter_output_db: Arc::new(atomic_float::AtomicF32::new(-120.0)),
 
             ir_load_status: Arc::new(atomic::AtomicU8::new(1)), // Start with success (embedded IR)
         }
@@ -684,6 +712,7 @@ impl Plugin for TheVictor {
         );
 
         // === PASS 3: Post-IR processing (output cal, master, DC block) ===
+        let mut output_peak = 0.0f32;
         {
             let output_channel = &mut buffer.as_slice()[0];
             for i in 0..num_samples {
@@ -707,6 +736,7 @@ impl Plugin for TheVictor {
                 // DC blocking
                 signal = self.dc_blocker_output.process(signal);
 
+                output_peak = output_peak.max(signal.abs());
                 output_channel[i] = signal;
             }
         }
@@ -714,6 +744,34 @@ impl Plugin for TheVictor {
         // === METER: snapshot metrics for GUI (once per buffer) ===
         let metrics = self.input_meter.get_metrics();
         self.meter_peak_volts.store(metrics.peak_volts, atomic::Ordering::Relaxed);
+
+        // === CIRCUIT STATS: supply voltages and output level ===
+        if power_on {
+            // Extract diag values before calling &mut methods
+            let diag = self.amp_topology.last_diag();
+            let bplus_sag = diag.b_plus_sag_in;
+
+            // B+: main supply rail (nominal 330V, droops under load)
+            let bplus_v = NOMINAL_BPLUS_5C1 * (1.0 - bplus_sag);
+            self.meter_bplus_volts.store(bplus_v, atomic::Ordering::Relaxed);
+
+            // V2: power tube plate supply (B+1 tap — same node as B+ in 5C1,
+            // but filtered through the first 8µF cap)
+            let sag_power = self.amp_topology.b_plus_for_stage("power_tube");
+            let v2_v = NOMINAL_BPLUS_5C1 * (1.0 - sag_power);
+            self.meter_v2_volts.store(v2_v, atomic::Ordering::Relaxed);
+
+            // V1: preamp supply (B+2 tap — after 25kΩ, heavily filtered)
+            let sag_preamp = self.amp_topology.b_plus_for_stage("preamp");
+            let v1_v = PREAMP_BPLUS_5C1 * (1.0 - sag_preamp);
+            self.meter_v1_volts.store(v1_v, atomic::Ordering::Relaxed);
+        }
+        let output_db = if output_peak > 1e-10 {
+            20.0 * output_peak.log10()
+        } else {
+            -120.0
+        };
+        self.meter_output_db.store(output_db, atomic::Ordering::Relaxed);
 
         ProcessStatus::Normal
     }
@@ -727,10 +785,17 @@ impl Plugin for TheVictor {
             let ir_status = self.ir_load_status.clone();
             let ir_path = self.params.ir_file_path.clone();
             let meter_peak_volts = self.meter_peak_volts.clone();
+            let meter_bplus_volts = self.meter_bplus_volts.clone();
+            let meter_v1_volts = self.meter_v1_volts.clone();
+            let meter_v2_volts = self.meter_v2_volts.clone();
+            let meter_output_db = self.meter_output_db.clone();
 
             create_egui_editor(
                 EguiState::from_size(800, 450),
-                gui::GuiState::new(ir_status, ir_path, meter_peak_volts),
+                gui::GuiState::new(
+                    ir_status, ir_path, meter_peak_volts,
+                    meter_bplus_volts, meter_v1_volts, meter_v2_volts, meter_output_db,
+                ),
                 |_, _| {},
                 move |egui_ctx, setter, state| {
                     gui::create(egui_ctx, setter, &params, state)

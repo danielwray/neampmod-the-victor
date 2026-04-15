@@ -7,6 +7,7 @@ use crate::{TheVictorParams, InputJack};
 // Embedded image assets
 const BACKGROUND_ON: &[u8] = include_bytes!("../gui/background_on.png");
 const BACKGROUND_OFF: &[u8] = include_bytes!("../gui/background_off.png");
+const AMP_IMAGE: &[u8] = include_bytes!("../gui/amp.png");
 const SWITCH_ON: &[u8] = include_bytes!("../gui/toggle_on.png");
 const SWITCH_OFF: &[u8] = include_bytes!("../gui/toggle_off.png");
 const LIGHT_ON: &[u8] = include_bytes!("../gui/light_on.png");
@@ -120,6 +121,16 @@ pub struct GuiState {
     pub ir_status: Arc<atomic::AtomicU8>,
     pub ir_path: Arc<Mutex<String>>,
     pub meter_peak_volts: Arc<atomic_float::AtomicF32>,
+
+    // Circuit stats (from audio thread)
+    pub meter_bplus_volts: Arc<atomic_float::AtomicF32>,
+    pub meter_v1_volts: Arc<atomic_float::AtomicF32>,
+    pub meter_v2_volts: Arc<atomic_float::AtomicF32>,
+    pub meter_output_db: Arc<atomic_float::AtomicF32>,
+
+    // Local GUI state
+    pub show_amp_view: bool,
+    pub show_circuit_stats: bool,
 }
 
 impl GuiState {
@@ -127,11 +138,21 @@ impl GuiState {
         ir_status: Arc<atomic::AtomicU8>,
         ir_path: Arc<Mutex<String>>,
         meter_peak_volts: Arc<atomic_float::AtomicF32>,
+        meter_bplus_volts: Arc<atomic_float::AtomicF32>,
+        meter_v1_volts: Arc<atomic_float::AtomicF32>,
+        meter_v2_volts: Arc<atomic_float::AtomicF32>,
+        meter_output_db: Arc<atomic_float::AtomicF32>,
     ) -> Self {
         Self {
             ir_status,
             ir_path,
             meter_peak_volts,
+            meter_bplus_volts,
+            meter_v1_volts,
+            meter_v2_volts,
+            meter_output_db,
+            show_amp_view: false,
+            show_circuit_stats: false,
         }
     }
 }
@@ -142,10 +163,10 @@ pub fn create(
     params: &Arc<TheVictorParams>,
     state: &mut GuiState,
 ) {
-    // Bottom panel for IR loading and calibration
+    // Bottom panel for IR loading, calibration, and view controls
     egui::TopBottomPanel::bottom("menu_bar").show(egui_ctx, |ui| {
         ui.vertical(|ui| {
-            // First row: IR loading
+            // First row: IR loading + view controls
             ui.horizontal(|ui| {
                 ui.label("IR Cabinet:");
 
@@ -194,6 +215,18 @@ pub fn create(
                             .unwrap_or("unknown");
                         ui.label(format!("({})", filename));
                     }
+                }
+
+                ui.separator();
+
+                // View toggle: front panel vs amp cabinet
+                if ui.button("View").clicked() {
+                    state.show_amp_view = !state.show_amp_view;
+                }
+
+                // Circuit stats modal
+                if ui.button("Circuit Stats").clicked() {
+                    state.show_circuit_stats = !state.show_circuit_stats;
                 }
             });
 
@@ -259,92 +292,178 @@ pub fn create(
     egui::CentralPanel::default()
         .frame(egui::Frame::new())
         .show(egui_ctx, |ui| {
-            // Set window size to match concept image proportions
             ui.set_min_size(Vec2::new(800.0, 400.0));
 
-            // Choose background based on power state
-            let background_bytes = if params.power.value() {
-                BACKGROUND_ON
+            if state.show_amp_view {
+                // === AMP CABINET VIEW ===
+                let amp_texture = load_texture_from_bytes(egui_ctx, "amp_view", AMP_IMAGE);
+                let amp_image = egui::Image::from_texture(&amp_texture)
+                    .fit_to_exact_size(Vec2::new(800.0, 400.0));
+                ui.add_sized([800.0, 400.0], amp_image);
             } else {
-                BACKGROUND_OFF
-            };
+                // === FRONT PANEL VIEW (default) ===
+                let background_bytes = if params.power.value() {
+                    BACKGROUND_ON
+                } else {
+                    BACKGROUND_OFF
+                };
 
-            // Load and display background image at exact size
-            let background_texture = load_texture_from_bytes(egui_ctx, "background", background_bytes);
-            let background_image = egui::Image::from_texture(&background_texture)
-                .fit_to_exact_size(Vec2::new(800.0, 400.0));
+                let background_texture = load_texture_from_bytes(egui_ctx, "background", background_bytes);
+                let background_image = egui::Image::from_texture(&background_texture)
+                    .fit_to_exact_size(Vec2::new(800.0, 400.0));
+                ui.add_sized([800.0, 400.0], background_image);
 
-            // Draw background
-            ui.add_sized([800.0, 400.0], background_image);
+                // Overlay controls
+                ui.allocate_new_ui(
+                    egui::UiBuilder::new().max_rect(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 400.0))),
+                    |ui| {
+                        // HI/LO input jack toggle
+                        {
+                            let is_hi = params.input_jack.value() == InputJack::Hi;
+                            draw_switch_with_tooltip(
+                                ui,
+                                Pos2::new(150.0, 120.0),
+                                is_hi,
+                                "Input Jack",
+                                "[UP = Hi (full signal), DOWN = Lo (-6dB pad)]",
+                                || {
+                                    let new_jack = if is_hi { InputJack::Lo } else { InputJack::Hi };
+                                    setter.set_parameter(&params.input_jack, new_jack);
+                                },
+                            );
+                        }
 
-            // Overlay controls
-            // Hi/Lo toggle, Power light + switch, Volume knob, Master knob
-            ui.allocate_new_ui(
-                egui::UiBuilder::new().max_rect(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 400.0))),
-                |ui| {
-                    // HI/LO input jack toggle
-                    {
-                        let is_hi = params.input_jack.value() == InputJack::Hi;
-                        draw_switch_with_tooltip(
+                        // POWER switch with indicator light
+                        draw_power_light(ui, Pos2::new(270.0, 120.0), params.power.value());
+
+                        {
+                            let power_value = params.power.value();
+                            draw_switch_with_tooltip(
+                                ui,
+                                Pos2::new(320.0, 120.0),
+                                power_value,
+                                "Power Toggle",
+                                "[This plugin has no pass-thru]",
+                                || setter.set_parameter(&params.power, !power_value),
+                            );
+                        }
+
+                        // VOLUME knob — 1MΩ Audio 30A, after V1, before 6V6
+                        draw_image_knob_with_tooltip(
                             ui,
-                            Pos2::new(150.0, 120.0),
-                            is_hi,
-                            "Input Jack",
-                            "[UP = Hi (full signal), DOWN = Lo (-6dB pad)]",
-                            || {
-                                let new_jack = if is_hi { InputJack::Lo } else { InputJack::Hi };
-                                setter.set_parameter(&params.input_jack, new_jack);
-                            },
+                            Pos2::new(450.0, 120.0),
+                            params.volume.value(),
+                            "Volume",
+                            "Volume (post-V1, drives 6V6 grid)",
+                            |_ui, new_value| setter.set_parameter(&params.volume, new_value),
+                        );
+
+                        // MASTER knob — linear, post-IR output level
+                        draw_image_knob_with_tooltip(
+                            ui,
+                            Pos2::new(600.0, 120.0),
+                            params.master.value(),
+                            "Master Volume",
+                            "Master Volume (post-IR, linear)",
+                            |_ui, new_value| setter.set_parameter(&params.master, new_value),
+                        );
+
+                        // Version identifier in bottom right corner
+                        let build_id = env!("CARGO_PKG_VERSION");
+                        ui.painter().text(
+                            Pos2::new(790.0, 390.0),
+                            egui::Align2::RIGHT_BOTTOM,
+                            build_id,
+                            egui::FontId::monospace(10.0),
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60),
                         );
                     }
-
-                    // POWER switch with indicator light
-                    draw_power_light(ui, Pos2::new(270.0, 120.0), params.power.value());
-
-                    {
-                        let power_value = params.power.value();
-                        draw_switch_with_tooltip(
-                            ui,
-                            Pos2::new(320.0, 120.0),
-                            power_value,
-                            "Power Toggle",
-                            "[This plugin has no pass-thru]",
-                            || setter.set_parameter(&params.power, !power_value),
-                        );
-                    }
-
-                    // VOLUME knob — 1MΩ Audio 30A, drives V1 preamp
-                    draw_image_knob_with_tooltip(
-                        ui,
-                        Pos2::new(450.0, 120.0),
-                        params.volume.value(),
-                        "Volume",
-                        "Volume (pre-V1 gain)",
-                        |_ui, new_value| setter.set_parameter(&params.volume, new_value),
-                    );
-
-                    // MASTER knob — linear, post-IR output level
-                    draw_image_knob_with_tooltip(
-                        ui,
-                        Pos2::new(600.0, 120.0),
-                        params.master.value(),
-                        "Master Volume",
-                        "Master Volume (post-IR, linear)",
-                        |_ui, new_value| setter.set_parameter(&params.master, new_value),
-                    );
-
-                    // Version identifier in bottom right corner
-                    let build_id = env!("CARGO_PKG_VERSION");
-                    ui.painter().text(
-                        Pos2::new(790.0, 390.0),
-                        egui::Align2::RIGHT_BOTTOM,
-                        build_id,
-                        egui::FontId::monospace(10.0),
-                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60),
-                    );
-                }
-            );
+                );
+            }
         });
+
+    // === CIRCUIT STATS MODAL ===
+    if state.show_circuit_stats {
+        let screen_rect = egui_ctx.screen_rect();
+        let modal_size = Vec2::new(240.0, 220.0);
+        let modal_rect = Rect::from_center_size(screen_rect.center(), modal_size);
+
+        egui::Area::new(egui::Id::new("stats_overlay"))
+            .fixed_pos(Pos2::ZERO)
+            .order(egui::Order::Foreground)
+            .show(egui_ctx, |ui| {
+                let (rect, response) = ui.allocate_exact_size(screen_rect.size(), egui::Sense::click());
+
+                // Dark overlay
+                ui.painter().rect_filled(
+                    rect, 0.0,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 180),
+                );
+
+                // Modal background
+                ui.painter().rect_filled(
+                    modal_rect, 8.0,
+                    egui::Color32::from_rgb(30, 30, 30),
+                );
+                ui.painter().rect_stroke(
+                    modal_rect, 8.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 80, 80)),
+                    egui::StrokeKind::Outside,
+                );
+
+                // Read circuit stats from audio thread
+                let input_mv = state.meter_peak_volts.load(atomic::Ordering::Relaxed) * 1000.0;
+                let bplus_v = state.meter_bplus_volts.load(atomic::Ordering::Relaxed);
+                let v1_v = state.meter_v1_volts.load(atomic::Ordering::Relaxed);
+                let v2_v = state.meter_v2_volts.load(atomic::Ordering::Relaxed);
+                let output_db = state.meter_output_db.load(atomic::Ordering::Relaxed);
+
+                let text_color = egui::Color32::from_rgb(220, 220, 220);
+                let label_color = egui::Color32::from_rgb(150, 150, 150);
+
+                // Title
+                ui.painter().text(
+                    Pos2::new(modal_rect.center().x, modal_rect.min.y + 25.0),
+                    egui::Align2::CENTER_CENTER,
+                    "Circuit Stats",
+                    egui::FontId::proportional(16.0),
+                    text_color,
+                );
+
+                // Signal flow: Input → V1 → V2 → Output, plus B+ supply
+                let left_x = modal_rect.min.x + 30.0;
+                let right_x = modal_rect.max.x - 30.0;
+                let mut y = modal_rect.min.y + 55.0;
+                let line_h = 26.0;
+
+                for (label, value) in [
+                    ("B+:", format!("{:.0}v", bplus_v)),
+                    ("Input:", format!("{:.0}mV", input_mv)),
+                    ("V1:", format!("{:.0}v", v1_v)),
+                    ("V2:", format!("{:.0}v", v2_v)),
+                    ("Output:", format!("{:.0}dB", output_db)),
+                ] {
+                    ui.painter().text(
+                        Pos2::new(left_x, y), egui::Align2::LEFT_CENTER,
+                        label, egui::FontId::proportional(14.0), label_color,
+                    );
+                    ui.painter().text(
+                        Pos2::new(right_x, y), egui::Align2::RIGHT_CENTER,
+                        &value, egui::FontId::proportional(14.0), text_color,
+                    );
+                    y += line_h;
+                }
+
+                // Click outside modal to close
+                if response.clicked() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        if !modal_rect.contains(pos) {
+                            state.show_circuit_stats = false;
+                        }
+                    }
+                }
+            });
+    }
 }
 
 // Helper function to load texture from PNG bytes
