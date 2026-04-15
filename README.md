@@ -8,8 +8,16 @@ The Victor is a circuit-level simulation inspired by the 1950's era Fender® Cha
 * The speaker impedence modelling assumes a Jensen® P8R speaker.
 
 <div style="text-align: center;">
-    <img width="50%" src="the_victor.png">
+    <img width="50%" src="img/the_victor.png">
 </div>
+
+<div style="text-align: center;">
+    <img width="50%" src="img/the_victor_controls.png">
+</div
+
+<div style="text-align: center;">
+    <img width="50%" src="img/the_victor_circuit_stats.png">
+</div
 
 ## Controls
 
@@ -41,6 +49,16 @@ NOTE: The included `default.wav` has audio artifacts/ is low-quality and should 
 ### Input / Output Trim
 
 See the `Gain Setup` section.
+
+### View
+
+Switches between viewing the front of the amplifiers and the amplifiers top control panel.
+
+You may ask what is the point? I was too pleased with the Blender model not to include the render.
+
+### Circuit Stats
+
+Shows the simulated voltage levels within the amp, the `V1` and `V2` are the B+ node voltages, not the plates.
 
 ## Using the Plugin
 
