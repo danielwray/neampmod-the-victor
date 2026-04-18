@@ -5,7 +5,7 @@ The Victor is a circuit-level simulation inspired by the 1950's era Fender® Cha
 * The preamp tube is a General Electric 6SJ7 in Pentode mode (Spline).
 * The poweramp tube is a General Electric 6V6GT (Spline).
 * The rectifier tube is a Generic 5Y3 (Koren).
-* The speaker impedence modelling assumes a Jensen® P8R speaker.
+* The speaker impedence modelling assumes a Jensen® P10R speaker.
 
 <div style="text-align: center;">
     <img width="50%" src="img/the_victor.png">
@@ -58,7 +58,7 @@ You may ask what is the point? I was too pleased with the Blender model not to i
 
 ### Circuit Stats
 
-Shows the simulated voltage levels within the amp, the `V1` and `V2` are the B+ node voltages, not the plates.
+Shows the simulated voltage levels within the amp, the `V1` and `V2` are the B+ plate voltages.
 
 ## Using the Plugin
 

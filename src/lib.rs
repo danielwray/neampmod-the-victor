@@ -21,7 +21,6 @@ use neampmod_engine::{
     FilterChainNodeSpec,
     FilterCapSpec,
     FilterResistorSpec,
-    // Speaker impedance (SpeakerPreset removed — using physics-based SpeakerModel path)
     // Calibration
     InputCalibration,
     OutputCalibration,
@@ -166,16 +165,14 @@ impl Default for TheVictorParams {
 // =============================================================================
 
 // --- Power Supply ---
-/// Nominal B+1 voltage at rectifier output / first filter cap (5Y3 loaded).
-/// Layout diagram measurement: 340V ±20% at 5Y3GT output.
-const NOMINAL_BPLUS_5C1: f32 = 340.0;
 /// Layout measurement: 6SJ7 plate at ~130V → supply ≈ 130 + (I_plate × 250kΩ) ≈ 220V.
 const PREAMP_BPLUS_5C1: f32 = 220.0;
 
 // --- Tubes ---
 /// V1 — General Electric 6SJ7 sharp-cutoff pentode (preamp)
-const V1_STOCK_SPEC: &str = "ge_6sj7_pentode_100k";
+const V1_STOCK_SPEC: &str = "ge_6sj7_pentode_250k";
 /// Power tube — General Electric 6V6GT configured for Champ
+/// TODO: Replace with ge_6v6gt_champ_5c1 tube after further refinement
 const POWER_TUBE_SPEC: &str = "ge_6v6gt_champ_5f1";
 /// Rectifier — 5Y3GT
 const RECTIFIER_SPEC: &str = "5y3";
@@ -259,20 +256,17 @@ fn build_5c1_filter_chain() -> FilterChainSpec {
 /// - Cathode bias: 500Ω
 /// - Grid leak: 1MΩ (volume pot)
 /// - 3-tap filter chain for B+ distribution
-/// - Jensen P8R speaker impedance (physics-based, 8" alnico, open-back)
+/// - Jensen P10R speaker impedance (physics-based, 10" alnico, open-back)
 /// - Tube specs from registry
 fn build_5c1_amp_topology_config() -> AmpTopologyConfig {
     let mut config = AmpTopologyConfig::fender_5f1();
-
-    // Enable current-based sag tracking for authentic 5Y3 rectifier response
-    config.power_supply.sag = config.power_supply.sag.with_current_tracking(55.0);
 
     // Set specific tube specs from registry
     config.power_section.power_tube_spec = Some(POWER_TUBE_SPEC.into());
     config.power_supply.sag.rectifier_spec = Some(RECTIFIER_SPEC.into());
 
-    // 5C1 cathode bias: 500Ω Rk, 2.5µF Ck, ~5kΩ plate load (OT primary)
-    config.power_section.cathode_bias = Some((500.0, 2.5e-6, 5_000.0));
+    // 5C1 cathode bias: 500Ω Rk, 25µF Ck, ~5kΩ plate load (OT primary)
+    config.power_section.cathode_bias = Some((500.0, 25e-6, 5_000.0));
 
     // 5C1 has no fixed grid-to-ground resistor on the 6V6 — the volume pot
     // bottom rail (wiper to ground) serves as the grid return path.
@@ -285,9 +279,9 @@ fn build_5c1_amp_topology_config() -> AmpTopologyConfig {
     // 5C1 power supply filter chain (2-tap: power_tube + preamp)
     config.filter_chain = Some(build_5c1_filter_chain());
 
-    // 8" Jensen P8R speaker impedance (physics-based), open-back cabinet
+    // 10" Jensen P10R speaker impedance (physics-based), open-back cabinet
     config.impedance = Some(ImpedanceConfig {
-        speaker_model: Some(SpeakerModel::JensenP8R),
+        speaker_model: Some(SpeakerModel::JensenP10R),
         cabinet_factor_override: Some(0.75), // open-back
         ..Default::default()
     });
@@ -350,9 +344,9 @@ pub struct TheVictor {
     meter_peak_volts: Arc<atomic_float::AtomicF32>,
 
     // Circuit stats (shared with GUI, written once per buffer)
-    meter_bplus_volts: Arc<atomic_float::AtomicF32>,   // B+ main rail (nominal 330V, sag-adjusted)
-    meter_v1_volts: Arc<atomic_float::AtomicF32>,     // V1 (6SJ7) plate supply
-    meter_v2_volts: Arc<atomic_float::AtomicF32>,     // V2 (6V6GT) plate supply
+    meter_bplus_volts: Arc<atomic_float::AtomicF32>,   // B+ main rail (reservoir cap, DC supply)
+    meter_v1_volts: Arc<atomic_float::AtomicF32>,     // V1 (6SJ7) plate-pin voltage (B+ − Ia·R_plate), buffer mean
+    meter_v2_volts: Arc<atomic_float::AtomicF32>,     // V2 (6V6GT) plate-pin voltage (B+ + plate_ac_volts), buffer mean
     meter_output_db: Arc<atomic_float::AtomicF32>,    // Peak output level in dB
 
     // IR loading state (shared with GUI)
@@ -398,7 +392,7 @@ impl Default for TheVictor {
             // AmpTopology: PI → 6V6GT SE → OT → speaker impedance + PSU
             amp_topology: AmpTopology::new(sample_rate, build_5c1_amp_topology_config()),
 
-            speaker_normalizer: SpeakerNormalizer::from_speaker_model(SpeakerModel::JensenP8R),
+            speaker_normalizer: SpeakerNormalizer::from_speaker_model(SpeakerModel::JensenP10R),
 
             // IR convolution — load embedded default.wav
             ir_convolver: {
@@ -515,7 +509,7 @@ impl Plugin for TheVictor {
 
         // Reinitialize AmpTopology (PI → power tube → OT → impedance + power supply)
         self.amp_topology = AmpTopology::new(self.sample_rate, build_5c1_amp_topology_config());
-        self.speaker_normalizer = SpeakerNormalizer::from_speaker_model(SpeakerModel::JensenP8R);
+        self.speaker_normalizer = SpeakerNormalizer::from_speaker_model(SpeakerModel::JensenP10R);
 
         // Reload IR convolver with new sample rate and DAW buffer size
         let persisted_ir_path = self.params.ir_file_path.lock()
@@ -626,6 +620,18 @@ impl Plugin for TheVictor {
         // === AmpTopology: begin buffer ===
         self.amp_topology.begin_buffer(num_samples);
 
+        // Preamp current accumulator — feeds the PSU integrator's preamp tap at
+        // `end_buffer` so the 25 kΩ dropper sees real 6SJ7 plate current (~3 mA
+        // typical) and develops the proper ~75 V drop from B+1 to B+3. Without
+        // this, cap[2] sits equal to cap[0] since no load drains it.
+        let mut preamp_current_sum = 0.0_f32;
+        let mut preamp_samples_counted = 0u32;
+
+        // Plate-voltage meter accumulators (per-buffer means).
+        let mut v1_plate_sum = 0.0_f32;
+        let mut v2_plate_sum = 0.0_f32;
+        let mut plate_samples_counted = 0u32;
+
         // === PASS 1: Per-sample signal chain ===
         for channel_samples in buffer.iter_samples() {
             for sample in channel_samples {
@@ -662,15 +668,19 @@ impl Plugin for TheVictor {
                 // cap + 5MΩ grid leak as a nonlinear element: DC blocking plus
                 // grid conduction rectification → blocking distortion (τ = 100ms).
 
-                // === B+ for preamp (from AmpTopology power supply) ===
-                let b_plus_preamp = self.amp_topology.b_plus_for_stage("preamp");
-
                 // === V1 PREAMP (6SJ7 pentode, contact bias) ===
-                // bias = 0.0 because contact bias means cathode is grounded,
-                // no external bias voltage from a cathode RC circuit.
-                // V1 runs at full gain regardless of volume setting — the 5C1
-                // design places the volume pot AFTER the preamp.
-                signal = self.v1_tube.process(signal, 0.0, b_plus_preamp);
+                // Contact bias means cathode is grounded — no external bias
+                // voltage from a cathode RC circuit.
+                let preamp_bplus = self.amp_topology.b_plus_for_stage("preamp");
+                signal = self.v1_tube.process(signal, preamp_bplus).plate_ac_volts;
+
+                // Accumulate real plate current (amperes) for the preamp tap —
+                // end_buffer feeds the mean into the PSU integrator.
+                preamp_current_sum += self.v1_tube.plate_current_amps();
+                preamp_samples_counted += 1;
+
+                // V1 plate voltage
+                v1_plate_sum += self.v1_tube.instantaneous_plate_volts();
 
                 // === COUPLING CAP OUT (0.02µF, V1 plate → volume pot, 1MΩ pot load) ===
                 signal = self.coupling_out.process(signal);
@@ -690,6 +700,14 @@ impl Plugin for TheVictor {
                 // === POWER SECTION (PI → 6V6GT SE → OT → speaker impedance) ===
                 let ot_volts = self.amp_topology.process_power_section(signal);
 
+                // V2 plate voltage.
+                v2_plate_sum += self.amp_topology
+                    .last_diag()
+                    .power_section
+                    .power_tube_pos
+                    .plate_voltage_volts;
+                plate_samples_counted += 1;
+
                 // === NORMALIZE SPEAKER (physical OT secondary volts → ±1 for IR) ===
                 signal = self.speaker_normalizer.process(ot_volts);
 
@@ -700,7 +718,14 @@ impl Plugin for TheVictor {
         }
 
         // === AmpTopology: end buffer ===
-        self.amp_topology.end_buffer(&[]);
+        // Wire the mean preamp plate current into the PSU integrator so B+3's
+        // cap sees real load through the 25 kΩ dropper.
+        let preamp_mean = if preamp_samples_counted > 0 {
+            preamp_current_sum / preamp_samples_counted as f32
+        } else {
+            0.0
+        };
+        self.amp_topology.end_buffer(&[("preamp", preamp_mean)]);
 
         // === PASS 2: Block IR convolution (zero-latency, matched to DAW buffer) ===
         for i in num_samples..self.ir_block_size {
@@ -745,26 +770,22 @@ impl Plugin for TheVictor {
         let metrics = self.input_meter.get_metrics();
         self.meter_peak_volts.store(metrics.peak_volts, atomic::Ordering::Relaxed);
 
-        // === CIRCUIT STATS: supply voltages and output level ===
+        // === CIRCUIT STATS: B+ supply + actual tube-plate voltages =========
+        //
+        // B+ is the reservoir-cap voltage at the power-tube tap (DC supply,
+        // moves a volt or two under PSU sag). V1 and V2 are the *plate-pin*
+        // voltages, averaged across the buffer.
         if power_on {
-            // Extract diag values before calling &mut methods
-            let diag = self.amp_topology.last_diag();
-            let bplus_sag = diag.b_plus_sag_in;
-
-            // B+: main supply rail (nominal 330V, droops under load)
-            let bplus_v = NOMINAL_BPLUS_5C1 * (1.0 - bplus_sag);
+            let bplus_v = self.amp_topology.b_plus_for_stage("power_tube");
             self.meter_bplus_volts.store(bplus_v, atomic::Ordering::Relaxed);
 
-            // V2: power tube plate supply (B+1 tap — same node as B+ in 5C1,
-            // but filtered through the first 8µF cap)
-            let sag_power = self.amp_topology.b_plus_for_stage("power_tube");
-            let v2_v = NOMINAL_BPLUS_5C1 * (1.0 - sag_power);
-            self.meter_v2_volts.store(v2_v, atomic::Ordering::Relaxed);
-
-            // V1: preamp supply (B+2 tap — after 25kΩ, heavily filtered)
-            let sag_preamp = self.amp_topology.b_plus_for_stage("preamp");
-            let v1_v = PREAMP_BPLUS_5C1 * (1.0 - sag_preamp);
-            self.meter_v1_volts.store(v1_v, atomic::Ordering::Relaxed);
+            if plate_samples_counted > 0 {
+                let n = plate_samples_counted as f32;
+                let v1_plate_mean = v1_plate_sum / n;
+                let v2_plate_mean = v2_plate_sum / n;
+                self.meter_v1_volts.store(v1_plate_mean, atomic::Ordering::Relaxed);
+                self.meter_v2_volts.store(v2_plate_mean, atomic::Ordering::Relaxed);
+            }
         }
         let output_db = if output_peak > 1e-10 {
             20.0 * output_peak.log10()
@@ -811,7 +832,7 @@ impl Plugin for TheVictor {
 
 impl ClapPlugin for TheVictor {
     const CLAP_ID: &'static str = "com.neampmod.the-victor";
-    const CLAP_DESCRIPTION: Option<&'static str> = Some("Circuit-accurate model of the Fender Champ 5C1 guitar amplifier.");
+    const CLAP_DESCRIPTION: Option<&'static str> = Some("Circuit-leve model of the Fender Champ 5C1 guitar amplifier.");
     const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
     const CLAP_FEATURES: &'static [ClapFeature] = &[
