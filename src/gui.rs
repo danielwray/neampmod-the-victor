@@ -279,7 +279,7 @@ pub fn create(
                 ui.label("Output:");
                 let mut output_trim = params.output_trim_db.unmodulated_plain_value();
                 if ui.add(
-                    egui::Slider::new(&mut output_trim, -24.0..=-3.0)
+                    egui::Slider::new(&mut output_trim, -24.0..=0.0)
                         .suffix(" dB")
                         .fixed_decimals(1)
                 ).changed() {

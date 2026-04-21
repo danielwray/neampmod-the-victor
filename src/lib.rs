@@ -28,8 +28,13 @@ use neampmod_engine::{
     InputLevelMeter,
     // Coupling capacitors
     CouplingCapacitor,
-    // Speaker normalizer
-    SpeakerNormalizer,
+    // Amp-referenced output normalizer (physical OT secondary volts → ±1 audio).
+    OutputNormalizer,
+    // TransformerRegistry: spec-driven OT construction (5C1 Triad 7kΩ SE)
+    TransformerRegistry,
+    // SpeakerModel still needed for ImpedanceConfig — impedance-curve selection
+    // lives on the electrical side of the power section, independent of the
+    // voltage normalization used for the IR path.
     SpeakerModel,
     // IR loader and convolver
     ir_loader,
@@ -147,7 +152,7 @@ impl Default for TheVictorParams {
             output_trim_db: FloatParam::new(
                 "Output Trim",
                 0.0,
-                FloatRange::Linear { min: -24.0, max: -3.0 },
+                FloatRange::Linear { min: -24.0, max: 0.0 },
             )
             .with_unit(" dB")
             .with_step_size(0.1)
@@ -167,6 +172,10 @@ impl Default for TheVictorParams {
 // --- Power Supply ---
 /// Layout measurement: 6SJ7 plate at ~130V → supply ≈ 130 + (I_plate × 250kΩ) ≈ 220V.
 const PREAMP_BPLUS_5C1: f32 = 220.0;
+/// 5C1 power-tube plate B+ (OT centre tap, B+1 tap; matches the nominal value
+/// in the engine's 5C1 topology spec). Used as the rail reference for
+/// `OutputNormalizer` — nominal, not sag-modulated.
+const POWER_BPLUS_5C1: f32 = 340.0;
 
 // --- Tubes ---
 /// V1 — General Electric 6SJ7 sharp-cutoff pentode (preamp)
@@ -176,6 +185,8 @@ const V1_STOCK_SPEC: &str = "ge_6sj7_pentode_250k";
 const POWER_TUBE_SPEC: &str = "ge_6v6gt_champ_5f1";
 /// Rectifier — 5Y3GT
 const RECTIFIER_SPEC: &str = "5y3";
+/// Output transformer — Triad 7kΩ SE (TweedEraSilicon + LayerWound)
+const OT_SPEC: &str = "fender_tweed_se_7k_5c1_triad";
 
 // --- 5C1 Volume Pot (between V1 output and 6V6 grid) ---
 /// Volume pot total resistance (Ω)
@@ -263,6 +274,7 @@ fn build_5c1_amp_topology_config() -> AmpTopologyConfig {
 
     // Set specific tube specs from registry
     config.power_section.power_tube_spec = Some(POWER_TUBE_SPEC.into());
+    config.power_section.transformer_spec = Some(OT_SPEC.into());
     config.power_supply.sag.rectifier_spec = Some(RECTIFIER_SPEC.into());
 
     // 5C1 cathode bias: 500Ω Rk, 25µF Ck, ~5kΩ plate load (OT primary)
@@ -325,7 +337,8 @@ pub struct TheVictor {
     amp_topology: AmpTopology,
 
     // === Speaker normalizer (OT secondary volts → normalized ±1 for IR) ===
-    speaker_normalizer: SpeakerNormalizer,
+    // Amp-referenced normalizer: divisor derived from 5C1 rail + SE OT turns ratio.
+    output_normalizer: OutputNormalizer,
 
     // === IR convolution (block-based, matched to DAW buffer size) ===
     ir_convolver: ir_convolver::ZeroLatencyConvolver,
@@ -379,7 +392,10 @@ impl Default for TheVictor {
             input_cal,
             jack_hi,
             jack_lo,
-            output_cal: OutputCalibration::pro_audio_headroom(),
+            // Output calibration trim — sized so that volume=12, master=12 lands
+            // at approximately -3 dBFS peak given the 5C1's measured
+            // post-OutputNormalizer signal level and IR convolution gain.
+            output_cal: OutputCalibration::with_trim_db(-21.0),
 
             // 1MΩ Audio 30A pot (5C1 volume control)
             volume_taper: PotTaperConfig::new(PotTaper::Audio30A),
@@ -392,7 +408,12 @@ impl Default for TheVictor {
             // AmpTopology: PI → 6V6GT SE → OT → speaker impedance + PSU
             amp_topology: AmpTopology::new(sample_rate, build_5c1_amp_topology_config()),
 
-            speaker_normalizer: SpeakerNormalizer::from_speaker_model(SpeakerModel::JensenP10R),
+            output_normalizer: {
+                let ot_spec = TransformerRegistry::global()
+                    .lookup(OT_SPEC)
+                    .expect("OT_SPEC must be present in the engine registry");
+                OutputNormalizer::from_spec(ot_spec, POWER_BPLUS_5C1)
+            },
 
             // IR convolution — load embedded default.wav
             ir_convolver: {
@@ -509,7 +530,12 @@ impl Plugin for TheVictor {
 
         // Reinitialize AmpTopology (PI → power tube → OT → impedance + power supply)
         self.amp_topology = AmpTopology::new(self.sample_rate, build_5c1_amp_topology_config());
-        self.speaker_normalizer = SpeakerNormalizer::from_speaker_model(SpeakerModel::JensenP10R);
+        self.output_normalizer = {
+            let ot_spec = TransformerRegistry::global()
+                .lookup(OT_SPEC)
+                .expect("OT_SPEC must be present in the engine registry");
+            OutputNormalizer::from_spec(ot_spec, POWER_BPLUS_5C1)
+        };
 
         // Reload IR convolver with new sample rate and DAW buffer size
         let persisted_ir_path = self.params.ir_file_path.lock()
@@ -709,7 +735,7 @@ impl Plugin for TheVictor {
                 plate_samples_counted += 1;
 
                 // === NORMALIZE SPEAKER (physical OT secondary volts → ±1 for IR) ===
-                signal = self.speaker_normalizer.process(ot_volts);
+                signal = self.output_normalizer.process(ot_volts);
 
                 // Store pre-IR signal for block convolution
                 self.pre_ir_buffer[sample_idx] = signal;
