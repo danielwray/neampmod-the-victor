@@ -1,6 +1,7 @@
 use nih_plug::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, atomic};
+use std::sync::atomic::Ordering;
 
 #[cfg(feature = "gui")]
 mod gui;
@@ -13,6 +14,7 @@ use neampmod_engine::{
     // AmpTopology
     AmpTopology,
     AmpTopologyConfig,
+    BPlusTap,
     ImpedanceConfig,
     // Filters
     DCBlocker,
@@ -46,8 +48,85 @@ use neampmod_engine::{
     JackInput,
 };
 
-// Embedded IR from assets/ir/default.wav (compiled into binary)
-const CABINET_IR_BYTES: &[u8] = include_bytes!("../assets/ir/default.wav");
+/// Crossfade duration used when swapping between IRs. 30 ms matches what
+/// commercial amp sims use (Neural DSP, Helix): short enough to feel instant,
+/// long enough that the new convolver's FIR/FFT history fills before the blend
+/// peaks. Stored in ms here and multiplied by sample rate at swap time.
+const IR_CROSSFADE_MS: f32 = 30.0;
+
+/// Shared state linking the GUI's Browse thread to the audio thread for IR
+/// swaps. Lives inside an `Arc` so both threads (and the persistence-triggered
+/// reload in `initialize`) hold references.
+pub struct IrLoadState {
+    pub pending: Mutex<Option<ir_convolver::ZeroLatencyConvolver>>,
+    pub sample_rate: atomic_float::AtomicF32,
+    pub block_size: atomic::AtomicUsize,
+    pub status: atomic::AtomicU8,
+}
+
+pub mod ir_load_status {
+    /// Load in progress — background thread is parsing/resampling the WAV.
+    pub const LOADING: u8 = 0;
+    /// Load succeeded — convolver was published and will be (or has been) swapped in.
+    pub const LOADED: u8 = 1;
+    /// Load failed — the prior IR (or unity) continues to play.
+    pub const FAILED: u8 = 2;
+    /// Default state before any IR is chosen. Audio path runs unity (pass-through).
+    pub const NO_IR: u8 = 3;
+}
+
+impl IrLoadState {
+    pub fn new() -> Self {
+        Self {
+            pending: Mutex::new(None),
+            sample_rate: atomic_float::AtomicF32::new(48_000.0),
+            block_size: atomic::AtomicUsize::new(512),
+            status: atomic::AtomicU8::new(ir_load_status::NO_IR),
+        }
+    }
+
+    /// Update the target audio format. Called by `initialize()` so the loader
+    /// sees the host's current sample rate and buffer size.
+    pub fn set_audio_format(&self, sample_rate: f32, block_size: usize) {
+        self.sample_rate.store(sample_rate, Ordering::Relaxed);
+        self.block_size.store(block_size, Ordering::Relaxed);
+    }
+}
+
+impl Default for IrLoadState {
+    fn default() -> Self { Self::new() }
+}
+
+/// Load an IR file into a shared `IrLoadState`. Runs off the audio thread —
+/// does WAV parsing, rubato resampling, DC removal, RMS normalisation, and FFT
+/// planning. Publishes the finished convolver to `state.pending` and sets
+/// `state.status`.
+pub fn load_ir_file_into_state(state: &IrLoadState, path: &std::path::Path) {
+    state.status.store(ir_load_status::LOADING, Ordering::Relaxed);
+
+    let sample_rate = state.sample_rate.load(Ordering::Relaxed);
+    let block_size = state.block_size.load(Ordering::Relaxed);
+
+    let loader = ir_loader::IrLoader::new(sample_rate);
+    match loader.load_from_file(path) {
+        Ok((mut ir, _, _)) => {
+            ir_loader::IrLoader::remove_dc_offset(&mut ir);
+            ir_loader::IrLoader::normalize_rms(&mut ir, -12.0);
+            let fir_len = 128.min(block_size);
+            let conv = ir_convolver::ZeroLatencyConvolver::new(&ir, block_size, fir_len);
+            if let Ok(mut pending) = state.pending.lock() {
+                // Overwrite any earlier pending convolver that hasn't been picked up
+                // yet — "latest wins" semantics match the HotSwap's rapid-flick
+                // instant-complete path.
+                *pending = Some(conv);
+            }
+            state.status.store(ir_load_status::LOADED, Ordering::Relaxed);
+        }
+        Err(_) => {
+            state.status.store(ir_load_status::FAILED, Ordering::Relaxed);
+        }
+    }
+}
 
 /// Maps internal 0.0–1.0 parameter value to faceplate numbering (1–12).
 fn v2s_dial_1_to_12() -> Arc<dyn Fn(f32) -> String + Send + Sync> {
@@ -160,7 +239,8 @@ impl Default for TheVictorParams {
             .with_value_to_string(formatters::v2s_f32_rounded(1))
             .with_string_to_value(Arc::new(|s: &str| s.trim().parse().ok())),
 
-            ir_file_path: Arc::new(Mutex::new("default.wav".to_string())),
+            // Empty path = "no IR loaded" — the signal path runs as a unity passthrough.
+            ir_file_path: Arc::new(Mutex::new(String::new())),
         }
     }
 }
@@ -335,16 +415,28 @@ pub struct TheVictor {
 
     // === AmpTopology: PI → 6V6GT SE → OT → speaker impedance + PSU ===
     amp_topology: AmpTopology,
+    // B+ tap handles, resolved once per AmpTopology lifetime to avoid per-sample
+    // string lookups. Refreshed in `initialize()` after `AmpTopology::new`.
+    preamp_tap: BPlusTap,
+    power_tube_tap: BPlusTap,
 
     // === Speaker normalizer (OT secondary volts → normalized ±1 for IR) ===
     // Amp-referenced normalizer: divisor derived from 5C1 rail + SE OT turns ratio.
     output_normalizer: OutputNormalizer,
 
     // === IR convolution (block-based, matched to DAW buffer size) ===
-    ir_convolver: ir_convolver::ZeroLatencyConvolver,
+    // `ir_convolver` wraps two `ZeroLatencyConvolver`s and crossfades between
+    // them on swap. The GUI thread builds new convolvers and drops them into
+    // `ir_load_state.pending`; the audio thread picks them up at the top of
+    // `process()` via `queue_swap`. See `IrLoadState` for the contract.
+    ir_convolver: ir_convolver::HotSwapConvolver,
+    ir_load_state: Arc<IrLoadState>,
     pre_ir_buffer: Vec<f32>,
     post_ir_buffer: Vec<f32>,
     ir_block_size: usize,
+    /// Crossfade length in samples, recomputed at `initialize()` time from
+    /// `IR_CROSSFADE_MS * sample_rate`. Passed to `HotSwapConvolver::queue_swap`.
+    ir_crossfade_samples: usize,
 
     // === Output ===
     dc_blocker_output: DCBlocker,
@@ -362,8 +454,6 @@ pub struct TheVictor {
     meter_v2_volts: Arc<atomic_float::AtomicF32>,     // V2 (6V6GT) plate-pin voltage (B+ + plate_ac_volts), buffer mean
     meter_output_db: Arc<atomic_float::AtomicF32>,    // Peak output level in dB
 
-    // IR loading state (shared with GUI)
-    ir_load_status: Arc<atomic::AtomicU8>,  // 0=pending, 1=success, 2=failed
 }
 
 impl Default for TheVictor {
@@ -384,6 +474,12 @@ impl Default for TheVictor {
         // Input meter — use Hi jack for default ceiling calculation
         let meter_ceiling = meter_ceiling_for_tube(&v1_tube, &jack_hi);
         let input_meter = InputLevelMeter::new(sample_rate, input_cal.input_scale(), meter_ceiling);
+
+        // Resolve B+ tap handles once at construction — avoids per-sample string
+        // lookups in process(). Refreshed in initialize() when topology rebuilds.
+        let amp_topology = AmpTopology::new(sample_rate, build_5c1_amp_topology_config());
+        let preamp_tap = amp_topology.b_plus_tap("preamp");
+        let power_tube_tap = amp_topology.b_plus_tap("power_tube");
 
         Self {
             params: Arc::new(TheVictorParams::default()),
@@ -406,7 +502,9 @@ impl Default for TheVictor {
             v1_tube,
 
             // AmpTopology: PI → 6V6GT SE → OT → speaker impedance + PSU
-            amp_topology: AmpTopology::new(sample_rate, build_5c1_amp_topology_config()),
+            amp_topology,
+            preamp_tap,
+            power_tube_tap,
 
             output_normalizer: {
                 let ot_spec = TransformerRegistry::global()
@@ -415,25 +513,17 @@ impl Default for TheVictor {
                 OutputNormalizer::from_spec(ot_spec, POWER_BPLUS_5C1)
             },
 
-            // IR convolution — load embedded default.wav
-            ir_convolver: {
-                let ir_loader = ir_loader::IrLoader::new(sample_rate);
-                match ir_loader.load_from_bytes(CABINET_IR_BYTES) {
-                    Ok((ir, _, _)) => {
-                        let mut processed_ir = ir;
-                        ir_loader::IrLoader::remove_dc_offset(&mut processed_ir);
-                        ir_loader::IrLoader::normalize_rms(&mut processed_ir, -12.0);
-                        ir_convolver::ZeroLatencyConvolver::new(&processed_ir, 512, 128)
-                    }
-                    Err(_) => {
-                        // Fallback: unity impulse (bypass)
-                        ir_convolver::ZeroLatencyConvolver::new(&[1.0], 512, 1)
-                    }
-                }
-            },
+            // IR convolution. Default state is a 1-tap unity-impulse convolver
+            // wrapped in HotSwap — equivalent to pass-through, with the right
+            // plumbing to crossfade in a real IR later. Actual IRs are loaded
+            // by the GUI's Browse thread into `ir_load_state.pending`; the
+            // audio thread picks them up at the top of `process()`.
+            ir_convolver: ir_convolver::HotSwapConvolver::new(&[1.0], 512, 1),
+            ir_load_state: Arc::new(IrLoadState::new()),
             pre_ir_buffer: vec![0.0; 512],
             post_ir_buffer: vec![0.0; 512],
             ir_block_size: 512,
+            ir_crossfade_samples: (IR_CROSSFADE_MS * 48.0) as usize, // 1440 samples at 48k
 
             dc_blocker_output: DCBlocker::new(sample_rate, 10.0),
 
@@ -446,37 +536,25 @@ impl Default for TheVictor {
             meter_v1_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
             meter_v2_volts: Arc::new(atomic_float::AtomicF32::new(0.0)),
             meter_output_db: Arc::new(atomic_float::AtomicF32::new(-120.0)),
-
-            ir_load_status: Arc::new(atomic::AtomicU8::new(1)), // Start with success (embedded IR)
         }
     }
 }
 
 impl TheVictor {
-    /// Load IR from file path. Returns true if successful.
-    pub fn load_ir_from_file(&mut self, path: &std::path::Path) -> bool {
-        use neampmod_engine::{ir_loader::IrLoader, ir_convolver::ZeroLatencyConvolver};
-
-        let ir_loader = IrLoader::new(self.sample_rate);
-
-        match ir_loader.load_from_file(path) {
-            Ok((mut ir, _, _)) => {
-                IrLoader::remove_dc_offset(&mut ir);
-                IrLoader::normalize_rms(&mut ir, -12.0);
-
-                let fir_len = 128.min(self.ir_block_size);
-                self.ir_convolver = ZeroLatencyConvolver::new(&ir, self.ir_block_size, fir_len);
-
-                self.ir_load_status.store(1, atomic::Ordering::Relaxed);
-                if let Ok(mut path_str) = self.params.ir_file_path.lock() {
-                    *path_str = path.display().to_string();
-                }
-
-                true
-            }
-            Err(_) => {
-                self.ir_load_status.store(2, atomic::Ordering::Relaxed);
-                false
+    /// Synchronously load an IR from a file path into the shared IR load
+    /// state. The built convolver is published to `ir_load_state.pending` and
+    /// picked up by the audio thread at the next `process()` call for a
+    /// crossfaded swap.
+    ///
+    /// This runs on the calling thread; callers must not invoke it from the
+    /// audio thread. In practice it's called from:
+    ///   * the GUI's Browse worker thread (after the file picker resolves), and
+    ///   * `initialize()` when restoring a persisted IR path from a saved session.
+    pub fn load_ir_from_file(&self, path: &std::path::Path) {
+        load_ir_file_into_state(&self.ir_load_state, path);
+        if self.ir_load_state.status.load(Ordering::Relaxed) == ir_load_status::LOADED {
+            if let Ok(mut p) = self.params.ir_file_path.lock() {
+                *p = path.display().to_string();
             }
         }
     }
@@ -530,6 +608,9 @@ impl Plugin for TheVictor {
 
         // Reinitialize AmpTopology (PI → power tube → OT → impedance + power supply)
         self.amp_topology = AmpTopology::new(self.sample_rate, build_5c1_amp_topology_config());
+        // Re-resolve B+ tap handles against the fresh topology's power supply.
+        self.preamp_tap = self.amp_topology.b_plus_tap("preamp");
+        self.power_tube_tap = self.amp_topology.b_plus_tap("power_tube");
         self.output_normalizer = {
             let ot_spec = TransformerRegistry::global()
                 .lookup(OT_SPEC)
@@ -537,36 +618,33 @@ impl Plugin for TheVictor {
             OutputNormalizer::from_spec(ot_spec, POWER_BPLUS_5C1)
         };
 
-        // Reload IR convolver with new sample rate and DAW buffer size
+        // === IR CONVOLVER REBUILD ===
+        // The audio format (sample rate, buffer size) may have changed. Rebuild
+        // `ir_convolver` as a fresh unity-impulse HotSwap at the new block
+        // size so the audio-thread invariant "convolver.block_size() ==
+        // self.ir_block_size" holds before process() runs. Then publish the
+        // new format to `ir_load_state` so any loader thread sees the current
+        // target when constructing future swaps.
+        self.ir_convolver = ir_convolver::HotSwapConvolver::new(&[1.0], self.ir_block_size, 1);
+        self.ir_crossfade_samples = (IR_CROSSFADE_MS * self.sample_rate / 1000.0) as usize;
+        self.ir_load_state.set_audio_format(self.sample_rate, self.ir_block_size);
+        self.ir_load_state.status.store(ir_load_status::NO_IR, Ordering::Relaxed);
+        if let Ok(mut p) = self.ir_load_state.pending.lock() {
+            *p = None;
+        }
+
+        // If the session persisted an IR path, reload it synchronously here.
+        // `initialize()` runs on the main/host thread, not the audio thread,
+        // so the allocating WAV+resample path is fine.
         let persisted_ir_path = self.params.ir_file_path.lock()
             .map(|p| p.clone())
-            .unwrap_or_else(|_| "default.wav".to_string());
-
-        let ir_reloaded = if persisted_ir_path != "default.wav" {
+            .unwrap_or_default();
+        if !persisted_ir_path.is_empty() {
             let path = std::path::PathBuf::from(&persisted_ir_path);
             if path.exists() {
-                self.load_ir_from_file(&path)
+                load_ir_file_into_state(&self.ir_load_state, &path);
             } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        if !ir_reloaded {
-            let ir_loader = ir_loader::IrLoader::new(self.sample_rate);
-            if let Ok((ir, _, _)) = ir_loader.load_from_bytes(CABINET_IR_BYTES) {
-                let mut processed_ir = ir;
-                ir_loader::IrLoader::remove_dc_offset(&mut processed_ir);
-                ir_loader::IrLoader::normalize_rms(&mut processed_ir, -12.0);
-                let fir_len = 128.min(self.ir_block_size);
-                self.ir_convolver = ir_convolver::ZeroLatencyConvolver::new(&processed_ir, self.ir_block_size, fir_len);
-            }
-            if persisted_ir_path != "default.wav" {
-                if let Ok(mut p) = self.params.ir_file_path.lock() {
-                    *p = "default.wav".to_string();
-                }
-                self.ir_load_status.store(2, atomic::Ordering::Relaxed);
+                self.ir_load_state.status.store(ir_load_status::FAILED, Ordering::Relaxed);
             }
         }
 
@@ -620,14 +698,15 @@ impl Plugin for TheVictor {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        // Check for pending IR load (once per buffer)
-        if self.ir_load_status.load(atomic::Ordering::Relaxed) == 0 {
-            let path_opt = self.params.ir_file_path.try_lock()
-                .ok()
-                .map(|guard| std::path::PathBuf::from(guard.as_str()));
-
-            if let Some(path) = path_opt {
-                self.load_ir_from_file(&path);
+        // === IR HOT-SWAP PICKUP ===
+        // Any loader thread (GUI Browse worker or session-restore path) may
+        // have published a freshly-built ZeroLatencyConvolver into
+        // `ir_load_state.pending`. Take it non-blockingly and hand it to the
+        // HotSwap wrapper, which will crossfade over the next
+        // `ir_crossfade_samples` samples.
+        if let Ok(mut pending) = self.ir_load_state.pending.try_lock() {
+            if let Some(new_conv) = pending.take() {
+                self.ir_convolver.queue_swap(new_conv, self.ir_crossfade_samples);
             }
         }
 
@@ -697,7 +776,7 @@ impl Plugin for TheVictor {
                 // === V1 PREAMP (6SJ7 pentode, contact bias) ===
                 // Contact bias means cathode is grounded — no external bias
                 // voltage from a cathode RC circuit.
-                let preamp_bplus = self.amp_topology.b_plus_for_stage("preamp");
+                let preamp_bplus = self.amp_topology.b_plus_at(self.preamp_tap);
                 signal = self.v1_tube.process(signal, preamp_bplus).plate_ac_volts;
 
                 // Accumulate real plate current (amperes) for the preamp tap —
@@ -751,7 +830,7 @@ impl Plugin for TheVictor {
         } else {
             0.0
         };
-        self.amp_topology.end_buffer(&[("preamp", preamp_mean)]);
+        self.amp_topology.end_buffer(&[(self.preamp_tap, preamp_mean)]);
 
         // === PASS 2: Block IR convolution (zero-latency, matched to DAW buffer) ===
         for i in num_samples..self.ir_block_size {
@@ -802,7 +881,7 @@ impl Plugin for TheVictor {
         // moves a volt or two under PSU sag). V1 and V2 are the *plate-pin*
         // voltages, averaged across the buffer.
         if power_on {
-            let bplus_v = self.amp_topology.b_plus_for_stage("power_tube");
+            let bplus_v = self.amp_topology.b_plus_at(self.power_tube_tap);
             self.meter_bplus_volts.store(bplus_v, atomic::Ordering::Relaxed);
 
             if plate_samples_counted > 0 {
@@ -829,7 +908,7 @@ impl Plugin for TheVictor {
             use nih_plug_egui::{create_egui_editor, EguiState};
 
             let params = self.params.clone();
-            let ir_status = self.ir_load_status.clone();
+            let ir_load_state = self.ir_load_state.clone();
             let ir_path = self.params.ir_file_path.clone();
             let meter_peak_volts = self.meter_peak_volts.clone();
             let meter_bplus_volts = self.meter_bplus_volts.clone();
@@ -840,7 +919,7 @@ impl Plugin for TheVictor {
             create_egui_editor(
                 EguiState::from_size(800, 450),
                 gui::GuiState::new(
-                    ir_status, ir_path, meter_peak_volts,
+                    ir_load_state, ir_path, meter_peak_volts,
                     meter_bplus_volts, meter_v1_volts, meter_v2_volts, meter_output_db,
                 ),
                 |_, _| {},

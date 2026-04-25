@@ -1,0 +1,23 @@
+# Per-plugin cargo configuration.
+#
+# NEAMPMOD_TUBES tells neampmod-engine's build.rs which tube LUT TOMLs to embed
+# via include_bytes! into the final .vst3. Only the tubes The Victor actually
+# references in src/lib.rs need to be in this list — anything else is dead
+# weight in the binary.
+#
+# When swapping a tube in src/lib.rs (e.g. ge_6sj7_pentode_250k -> ...),
+# update this list to match. The engine's build.rs will warn at compile time
+# if any name here doesn't correspond to a TOML in
+# neampmod-engine/assets/luts/v4/{preamp,poweramp,rectifier,...}.
+#
+# Names are TOML file stems (no .toml extension). Order is irrelevant.
+#
+# Victor is a 5F1 Champ-style single-ended topology — no phase inverter needed.
+#
+# Currently embedded:
+#   ge_6sj7_pentode_250k      — V1 (pentode preamp, 250k plate)
+#   ge_6v6gt_champ_5f1        — power tube (single-ended)
+#   5y3                       — rectifier
+
+[env]
+NEAMPMOD_TUBES = "ge_6sj7_pentode_250k,ge_6v6gt_champ_5f1,5y3"

@@ -44,7 +44,9 @@ Linear fine-tuning volume control at end of circuit after IR, this does not impa
 
 Opens an OS-native file window, navigate to your IR WAV file and load it.
 
-NOTE: The included `default.wav` has audio artifacts/ is low-quality and should be replaced, see below for suggestions on free IRs.
+From version 2.1.0 onwards the plugin ships with **no** default IR — the signal path runs as a unity passthrough until you load one. The status strip reads "No IR Loaded" in this state. See below for suggestions on free IRs.
+
+WAV files at any sample rate (44.1/48/88.2/96/176.4/192 kHz) are supported; the plugin resamples to the host rate on load using a high-quality polyphase FFT resampler. Loading is off the audio thread and swaps in with a short equal-power crossfade so there are no clicks when you switch cabs during playback.
 
 ### Input / Output Trim
 
@@ -67,8 +69,7 @@ The Victor is available in VST3 and CLAP plugin formats for Linux and Windows.
 To install the plugins copy the `.vst3` to your VST3 directory, and likewise to your `.clap` directory for
 the CLAP plugin.
 
-The plugin includes a `default.wav` IR file, I strongly suggest loading a higher quality IR file to get
-the best out of the plugin; The following sources provide excellent impulse response files:
+The plugin does not ship with a default IR file — you must load your own. The following sources provide excellent impulse response files:
 
 * [Origin Effects IR Cab Library](https://origineffects.com/product/ir-cab-library/)
 * [Tone3000](https://tone3000.com/)
